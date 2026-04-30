@@ -1,144 +1,175 @@
-//THIS CODE IS NOT MINE. IT IS TAKEN FROM THE TUTORIAL LINKED BELOW. EDDITED TO SUITE OUR NEEDS.
-// Tutorial : https://youtu.be/jYcxUgxz9ks
-// Use board "ESP32 Dev Module" (last tested on v3.2.0)
+// AnimationPlayer.cpp
+// Drives MJPEG animation playback on the Cheap Yellow Display (CYD) via an SD card.
+// Adapted from: https://youtu.be/jYcxUgxz9ks
+// Original code is NOT mine; edited to suit RSC (Robotic Study Companion) needs.
+//
+// Target board : "ESP32 Dev Module" (last tested with Espressif Arduino Core v3.2.0)
+//
+// How it works:
+//   1. On first call to used_to_be_setup(), the display and SD card are initialised
+//      and a list of .mjpeg files in the current emotion folder is built.
+//   2. updateAnimationPlayer() is called every loop iteration.  It plays the next
+//      .mjpeg file in the list and advances the index, looping back to 0 when it
+//      reaches the end.
+//   3. switchFolder() resets the index and rebuilds the file list for a new emotion
+//      folder, allowing main.cpp to change the displayed emotion at any time.
+//   4. The physical boot button (GPIO 0) triggers an interrupt that sets skipRequested,
+//      causing the current animation to be cut short and the next one to start.
 
 #include <Arduino_GFX_Library.h> // Install "GFX Library for Arduino" with the Library Manager (last tested on v1.6.0)
                                  // Install "JPEGDEC" with the Library Manager (last tested on v1.8.2)
 #include "MjpegClass.h"          // Included in this project
 #include "SD.h"                  // Included with the Espressif Arduino Core (last tested on v3.2.0)
 
-// Pins for the display
-#define BL_PIN 21 // On some cheap yellow display model, BL pin is 27
-#define SD_CS 5
-#define SD_MISO 19
-#define SD_MOSI 23
-#define SD_SCK 18
+// ---------------------------------------------------------------------------
+// Pin definitions
+// ---------------------------------------------------------------------------
+// Display (ILI9341) is on the primary HSPI bus; SD card uses VSPI.
+#define BL_PIN 21   // Display backlight enable. Some CYD variants use pin 27 instead.
+#define SD_CS  5    // SD card chip-select
+#define SD_MISO 19  // SD VSPI MISO
+#define SD_MOSI 23  // SD VSPI MOSI
+#define SD_SCK  18  // SD VSPI clock
 
-#define BOOT_PIN 0                   // Boot pin
-#define BOOT_BUTTON_DEBOUCE_TIME 400 // Debounce time when reading the boot button in milliseconds
+#define BOOT_PIN 0                   // Boot / skip button (active LOW)
+#define BOOT_BUTTON_DEBOUCE_TIME 400 // Minimum ms between recognised button presses
 
-// Some model of cheap Yellow display works only at 40Mhz
-// #define DISPLAY_SPI_SPEED 40000000L // 40MHz 
-#define DISPLAY_SPI_SPEED 80000000L // 80MHz 
+// ---------------------------------------------------------------------------
+// SPI speed configuration
+// ---------------------------------------------------------------------------
+// Some CYD variants are unstable at 80 MHz; uncomment the 40 MHz line if needed.
+// #define DISPLAY_SPI_SPEED 40000000L // 40 MHz
+#define DISPLAY_SPI_SPEED 80000000L   // 80 MHz
+#define SD_SPI_SPEED      80000000L   // 80 MHz
 
+// ---------------------------------------------------------------------------
+// Animation state
+// ---------------------------------------------------------------------------
+String currentFolder = "/mjpeg"; // Active emotion folder on the SD card
 
-#define SD_SPI_SPEED 80000000L      // 80Mhz
+// In-memory list of .mjpeg filenames found in currentFolder
+#define MAX_FILES 20
+String   mjpegFileList[MAX_FILES];
+uint32_t mjpegFileSizes[MAX_FILES] = {0}; // Size of each file in bytes
+int      mjpegCount = 0;
+static int  currentMjpegIndex = 0;
+static File mjpegFile; // Temporary file handle used during playback
 
-String currentFolder = "/mjpeg"; // Name of the mjpeg folder on the SD Card
-
-// Storage for files to read on the SD card
-#define MAX_FILES 20 // Maximum number of files, adjust as needed
-String mjpegFileList[MAX_FILES];
-uint32_t mjpegFileSizes[MAX_FILES] = {0}; // Store each GIF file's size in bytes
-int mjpegCount = 0;
-static int currentMjpegIndex = 0;
-static File mjpegFile; // temp gif file holder
-
-// Global variables for mjpeg
-MjpegClass mjpeg;
-int total_frames;
+// ---------------------------------------------------------------------------
+// MJPEG decoder state (allocated once in used_to_be_setup)
+// ---------------------------------------------------------------------------
+MjpegClass    mjpeg;
+int           total_frames;
 unsigned long total_read_video;
 unsigned long total_decode_video;
 unsigned long total_show_video;
 unsigned long start_ms, curr_ms;
-long output_buf_size, estimateBufferSize;
-uint8_t *mjpeg_buf;
-uint16_t *output_buf;
+long          output_buf_size, estimateBufferSize;
+uint8_t  *mjpeg_buf;   // JPEG bitstream buffer (PSRAM / 8-bit capable heap)
+uint16_t *output_buf;  // Decoded pixel row buffer (DMA-capable, 16-bit aligned)
 
-// Display global variables
+// ---------------------------------------------------------------------------
+// Display driver
+// ---------------------------------------------------------------------------
+// The CYD uses an ILI9341 2.8" 240×320 display on the HSPI bus.
+// Pin mapping: DC=2, CS=15, SCK=14, MOSI=13, MISO=12
 Arduino_DataBus *bus = new Arduino_HWSPI(2 /* DC */, 15 /* CS */, 14 /* SCK */, 13 /* MOSI */, 12 /* MISO */);
-Arduino_GFX *gfx = new Arduino_ILI9341(bus);
+Arduino_GFX     *gfx = new Arduino_ILI9341(bus);
 
-// SD Card reader is on a separate SPI
+// SD card reader is on the separate VSPI peripheral
 SPIClass sd_spi(VSPI);
 
-// Interrupt to skip to the next mjpeg when the boot button is pressed
-volatile bool skipRequested = false; // set in ISR, read in loop()
-volatile uint32_t isrTick = 0;       // tick count captured in ISR
-uint32_t lastPress = 0;              // used in main context for debounc
+// ---------------------------------------------------------------------------
+// Boot-button interrupt (runs in IRAM for safety)
+// ---------------------------------------------------------------------------
+volatile bool     skipRequested = false; // Set by ISR; cleared after the current animation ends
+volatile uint32_t isrTick = 0;           // FreeRTOS tick captured at interrupt time
+uint32_t          lastPress = 0;         // Used in main context for debounce
 
+/**
+ * @brief ISR fired on the FALLING edge of BOOT_PIN.
+ *        Sets skipRequested so the main loop can abort the current animation.
+ */
 void IRAM_ATTR onButtonPress()
 {
-    skipRequested = true;                 // flag handled in the playback loop
-    isrTick = xTaskGetTickCountFromISR(); // safe, 1-tick resolution
+    skipRequested = true;
+    isrTick = xTaskGetTickCountFromISR();
 }
 
-// --- Funktsioonide eelteated (prototüübid) ---
-
-void loadMjpegFilesList();
-void playSelectedMjpeg(int mjpegIndex);
-void mjpegPlayFromSDCard(char *mjpegFilename);
-void switchFolder(const String& newFolder);
+// ---------------------------------------------------------------------------
+// Forward declarations
+// ---------------------------------------------------------------------------
+void   loadMjpegFilesList();
+void   playSelectedMjpeg(int mjpegIndex);
+void   mjpegPlayFromSDCard(char *mjpegFilename);
+void   switchFolder(const String& newFolder);
 String formatBytes(size_t bytes);
 
 
+/**
+ * @brief One-time hardware and buffer initialisation.
+ *
+ * Must be called once before the first call to updateAnimationPlayer().
+ * Initialises:
+ *  - Display backlight and ILI9341 driver
+ *  - SD card (VSPI, mounted at "/sd")
+ *  - DMA output buffer and MJPEG bitstream buffer
+ *  - Boot-button interrupt
+ *  - Initial file list for the default emotion folder
+ */
 void used_to_be_setup()
 {
-        //Serial.begin(115200);
-
-    // Set display backlight to High
+    // Turn on the display backlight
     pinMode(BL_PIN, OUTPUT);
     digitalWrite(BL_PIN, HIGH);
 
-    // Display initialization
-    //Serial.println("Display initialization");
+    // Initialise the ILI9341 display
     if (!gfx->begin(DISPLAY_SPI_SPEED))
     {
-        //Serial.println("Display initialization failed!");
-        while (true)
-        {
-            /* no need to continue */
-        }
+        // Display init failed – halt; check wiring and SPI speed
+        while (true) { /* no need to continue */ }
     }
     gfx->setRotation(0);
     gfx->fillScreen(RGB565_BLACK);
-    // gfx->invertDisplay(true); // on some cheap yellow models, display must be inverted
-    //Serial.printf("Screeen size Width=%d,Height=%d\n", gfx->width(), gfx->height());
+    // gfx->invertDisplay(true); // Uncomment on CYD variants with inverted colour
 
-    // SD card initialization
-    //Serial.println("SD Card initialization");
+    // Initialise the SD card on VSPI
     if (!SD.begin(SD_CS, sd_spi, SD_SPI_SPEED, "/sd"))
     {
-        //Serial.println("ERROR: File system mount failed!");
-        while (true)
-        {
-            /* no need to continue */
-        }
+        // SD init failed – halt; check card is inserted and wiring is correct
+        while (true) { /* no need to continue */ }
     }
 
-    // Buffer allocation for m   playing
-    //Serial.println("Buffer allocation");
+    // Allocate the DMA-capable output (pixel row) buffer
     output_buf_size = gfx->width() * 4 * 2;
     output_buf = (uint16_t *)heap_caps_aligned_alloc(16, output_buf_size * sizeof(uint16_t), MALLOC_CAP_DMA);
     if (!output_buf)
     {
-        //Serial.println("output_buf aligned_alloc failed!");
-        while (true)
-        {
-            /* no need to continue */
-        }
+        while (true) { /* DMA buffer allocation failed */ }
     }
+
+    // Allocate the MJPEG bitstream buffer
     estimateBufferSize = gfx->width() * gfx->height() * 2 / 5;
     mjpeg_buf = (uint8_t *)heap_caps_malloc(estimateBufferSize, MALLOC_CAP_8BIT);
     if (!mjpeg_buf)
     {
-        //Serial.println("mjpeg_buf allocation failed!");
-        while (true)
-        {
-            /* no need to continue */
-        }
+        while (true) { /* MJPEG buffer allocation failed */ }
     }
 
-    loadMjpegFilesList(); // Load the list of mjpeg to play from the SD card
+    loadMjpegFilesList(); // Populate the file list for the initial folder
 
-    // Set the boot button to skip the current mjpeg playing and go to the next
-    pinMode(BOOT_PIN, INPUT);                        
-    attachInterrupt(digitalPinToInterrupt(BOOT_PIN), // fast ISR
-                    onButtonPress, FALLING);         // press == LOW
-    
+    // Attach the boot button interrupt (skip to next animation on press)
+    pinMode(BOOT_PIN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(BOOT_PIN), onButtonPress, FALLING);
 }
 
 
+/**
+ * @brief Advance and play the next animation in the current folder.
+ *
+ * Call this every loop() iteration.  It plays the .mjpeg at currentMjpegIndex,
+ * then increments the index, wrapping back to 0 after the last file.
+ */
 void updateAnimationPlayer()
 {
     playSelectedMjpeg(currentMjpegIndex);
@@ -150,18 +181,27 @@ void updateAnimationPlayer()
     }
 }
 
-// Play the current mjpeg
+/**
+ * @brief Build the full SD path for a file index and start playback.
+ * @param mjpegIndex Index into mjpegFileList[] for the file to play.
+ */
 void playSelectedMjpeg(int mjpegIndex)
 {
-    // Build the full path for the selected mjpeg
     String fullPath = currentFolder + "/" + mjpegFileList[mjpegIndex];
     char mjpegFilename[128];
     fullPath.toCharArray(mjpegFilename, sizeof(mjpegFilename));
 
-    //Serial.printf("Playing %s\n", mjpegFilename);
     mjpegPlayFromSDCard(mjpegFilename);
 }
 
+/**
+ * @brief Switch the active emotion folder and reload the file list.
+ *
+ * After this call, updateAnimationPlayer() will play animations from newFolder,
+ * starting from the first file.
+ *
+ * @param newFolder Absolute SD-card path to the emotion folder (e.g. "/caring").
+ */
 void switchFolder(const String& newFolder)
 {
     currentFolder = newFolder;
@@ -169,7 +209,15 @@ void switchFolder(const String& newFolder)
     loadMjpegFilesList();
 }
 
-// Callback function to draw a JPEG
+/**
+ * @brief JPEGDEC draw callback – blits a decoded JPEG tile to the display.
+ *
+ * Called repeatedly by the MJPEG decoder for each 16-pixel-high tile decoded
+ * from a single video frame.
+ *
+ * @param pDraw Pointer to the JPEGDRAW struct provided by JPEGDEC.
+ * @return 1 to continue decoding, 0 to abort.
+ */
 int jpegDrawCallback(JPEGDRAW *pDraw)
 {
     unsigned long s = millis();
@@ -178,101 +226,96 @@ int jpegDrawCallback(JPEGDRAW *pDraw)
     return 1;
 }
 
-// Play a mjpeg stored on the SD card
+/**
+ * @brief Open and play a single .mjpeg file from the SD card.
+ *
+ * Streams the file frame-by-frame through the JPEGDEC decoder and draws each
+ * frame to the display.  Playback ends when either:
+ *   - The file has been fully read, or
+ *   - The boot button sets skipRequested (with debounce handling).
+ *
+ * @param mjpegFilename Absolute SD path to the .mjpeg file (e.g. "/caring/idle.mjpeg").
+ */
 void mjpegPlayFromSDCard(char *mjpegFilename)
 {
-    //Serial.printf("Opening %s\n", mjpegFilename);
     File mjpegFile = SD.open(mjpegFilename, "r");
 
     if (!mjpegFile || mjpegFile.isDirectory())
     {
-        //Serial.printf("ERROR: Failed to open %s file for reading\n", mjpegFilename);
+        // File could not be opened – skip silently and continue
+        return;
     }
-    else
+
+    gfx->fillScreen(RGB565_BLACK);
+
+    start_ms = millis();
+    curr_ms  = millis();
+    total_frames       = 0;
+    total_read_video   = 0;
+    total_decode_video = 0;
+    total_show_video   = 0;
+
+    mjpeg.setup(
+        &mjpegFile, mjpeg_buf, jpegDrawCallback, true /* useBigEndian */,
+        0 /* x */, 0 /* y */, gfx->width() /* widthLimit */, gfx->height() /* heightLimit */);
+
+    // Main decode/display loop – exits when the file ends or skip is requested
+    while (!skipRequested && mjpegFile.available() && mjpeg.readMjpegBuf())
     {
-        //Serial.println("MJPEG start");
-        gfx->fillScreen(RGB565_BLACK);
-
-        start_ms = millis();
+        total_read_video += millis() - curr_ms;
         curr_ms = millis();
-        total_frames = 0;
-        total_read_video = 0;
-        total_decode_video = 0;
-        total_show_video = 0;
 
-        mjpeg.setup(
-            &mjpegFile, mjpeg_buf, jpegDrawCallback, true /* useBigEndian */,
-            0 /* x */, 0 /* y */, gfx->width() /* widthLimit */, gfx->height() /* heightLimit */);
+        mjpeg.drawJpg();
+        total_decode_video += millis() - curr_ms;
 
-        while (!skipRequested && mjpegFile.available() && mjpeg.readMjpegBuf())
-        {
-            // Read video
-            total_read_video += millis() - curr_ms;
-            curr_ms = millis();
-
-            // Play video
-            mjpeg.drawJpg();
-            total_decode_video += millis() - curr_ms;
-
-            curr_ms = millis();
-            total_frames++;
-        }
-        /* We exited because the button was pressed or the video ended */
-        if (skipRequested) // pressed?
-        {
-            uint32_t now = millis(); // safe here
-            if (now - lastPress < BOOT_BUTTON_DEBOUCE_TIME)
-            {
-                // ignore if it was within the debounce time
-            }
-            else
-            {
-                lastPress = now;
-            }
-        }
-        skipRequested = false;
-
-        int time_used = millis() - start_ms;
-        //Serial.println(F("MJPEG end"));
-        mjpegFile.close();
-        skipRequested = false; // ready for next video
-        float fps = 1000.0 * total_frames / time_used;
-        total_decode_video -= total_show_video;
-        //Serial.printf("Total frames: %d\n", total_frames);
-        //Serial.printf("Time used: %d ms\n", time_used);
-        //Serial.printf("Average FPS: %0.1f\n", fps);
-        //Serial.printf("Read MJPEG: %lu ms (%0.1f %%)\n", total_read_video, 100.0 * total_read_video / time_used);
-        //Serial.printf("Decode video: %lu ms (%0.1f %%)\n", total_decode_video, 100.0 * total_decode_video / time_used);
-        //Serial.printf("Show video: %lu ms (%0.1f %%)\n", total_show_video, 100.0 * total_show_video / time_used);
-        //Serial.printf("Video size (wxh): %d×%d, scale factor=%d\n",mjpeg.getWidth(),mjpeg.getHeight(),mjpeg.getScale());
+        curr_ms = millis();
+        total_frames++;
     }
+
+    // Handle debounced skip-button press
+    if (skipRequested)
+    {
+        uint32_t now = millis();
+        if (now - lastPress >= BOOT_BUTTON_DEBOUCE_TIME)
+        {
+            lastPress = now;
+        }
+    }
+    skipRequested = false; // Clear flag so the next animation plays normally
+
+    mjpegFile.close();
 }
 
-// Read the mjpeg file list in the mjpeg folder of the SD card
+/**
+ * @brief Scan the current emotion folder and populate mjpegFileList[].
+ *
+ * Only files whose names end with ".mjpeg" are included.  Up to MAX_FILES
+ * entries are stored; additional files beyond that limit are ignored.
+ * Sets mjpegCount to the number of valid files found.
+ */
 void loadMjpegFilesList()
 {
     File mjpegDir = SD.open(currentFolder);
     if (!mjpegDir)
     {
-        //Serial.printf("Failed to open %s folder\n", currentFolder.c_str());
-        while (true)
-        {
-            /* code */
-        }
+        // Folder not found – halt; check SD card contents
+        while (true) { /* no need to continue */ }
     }
+
     mjpegCount = 0;
     while (true)
     {
         File file = mjpegDir.openNextFile();
         if (!file)
             break;
+
         if (!file.isDirectory())
         {
             String name = file.name();
             if (name.endsWith(".mjpeg"))
             {
-                mjpegFileList[mjpegCount] = name;
-                mjpegFileSizes[mjpegCount] = file.size(); // Save file size (in bytes)
+                mjpegFileList[mjpegCount]  = name;
+                mjpegFileSizes[mjpegCount] = file.size();
                 mjpegCount++;
                 if (mjpegCount >= MAX_FILES)
                     break;
@@ -281,15 +324,13 @@ void loadMjpegFilesList()
         file.close();
     }
     mjpegDir.close();
-    //Serial.printf("%d mjpeg files read\n", mjpegCount);
-    // Optionally, print out each file's size for debugging:
-    for (int i = 0; i < mjpegCount; i++)
-    {
-        //Serial.printf("File %d: %s, Size: %lu bytes (%s)\n", i, mjpegFileList[i].c_str(), mjpegFileSizes[i],formatBytes(mjpegFileSizes[i]).c_str());
-    }
 }
 
-// Function helper display sizes on the serial monitor
+/**
+ * @brief Format a byte count as a human-readable string (B / KB / MB).
+ * @param bytes Number of bytes to format.
+ * @return Formatted string, e.g. "1.23 MB".
+ */
 String formatBytes(size_t bytes)
 {
     if (bytes < 1024)
